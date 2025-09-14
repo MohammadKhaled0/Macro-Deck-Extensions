@@ -1,0 +1,229 @@
+name: 'Build Macro Deck Extension'
+description: 'Build a Macro Deck Extension from source'
+
+inputs:
+  extension-path:
+    description: 'Path of the extension'
+    required: true
+  artifact-name:
+    description: 'Name for the uploaded artifact'
+    required: true
+
+outputs:
+  error-code:
+    value: ${{ steps.set_error_code.outputs.value }}
+    
+runs:
+  using: "composite"
+  
+  steps:
+  - name: Install Dependencies
+    shell: bash
+    run: sudo apt-get install -y xmlstarlet dos2unix
+
+  - name: Extract Extension Info
+    id: extension_info
+    shell: bash
+    run: |
+      delim="EOF-${RANDOM}"
+      echo "manifest<<${delim}" >> $GITHUB_ENV
+      cat "./${{ inputs.extension-path }}/ExtensionManifest.json" | dos2unix | perl -pe 'chomp if eof' >> $GITHUB_ENV
+      echo -e "\n${delim}" >> $GITHUB_ENV
+
+  - name: Print Extension Info
+    shell: bash
+    run: |
+      echo "[Extension Info Values]"
+      echo "Version                  : ${{ fromJSON(env.manifest).version }}"
+      echo "Type                     : ${{ fromJSON(env.manifest).type }}"
+      echo "Package ID               : ${{ fromJSON(env.manifest).packageId }}"
+      echo "GitHub Repository        : ${{ fromJSON(env.manifest).repository }}"
+      echo "Name                     : ${{ fromJSON(env.manifest).name }}"
+      echo "Author                   : ${{ fromJSON(env.manifest).author }}"
+      echo "Target Plugin API Version: ${{ fromJSON(env.manifest).target-plugin-api-version }}"
+      echo "Target Macro Deck Version: ${{ fromJSON(env.manifest).target-macro-deck-version }}"
+
+  - name: Validate Extension Info
+    id: validate_extension_manifest
+    if: |
+      fromJSON(env.manifest).type == '' || 
+      fromJSON(env.manifest).name == '' || 
+      fromJSON(env.manifest).author == '' || 
+      fromJSON(env.manifest).repository == '' || 
+      fromJSON(env.manifest).packageId == '' || 
+      fromJSON(env.manifest).version == '' ||
+      fromJSON(env.manifest).target-plugin-api-version == '' || 
+      fromJSON(env.manifest).target-macro-deck-version == ''
+    shell: bash
+    run: echo "::error file=ExtensionManifest.json::Invalid manifest! Required attributes [version, type, packageId, target-plugin-api-version, target-macro-deck-version]" && exit 1
+
+  - name: Cache Macro Deck
+    id: cache-macro-deck
+    uses: actions/cache@v3
+    with:
+      path: './macro-deck/output/Macro Deck 2.dll'
+      key: macro-deck-${{ fromJSON(env.manifest).target-macro-deck-version }}
+
+  - name: Checkout Macro Deck Repository
+    if: steps.cache-macro-deck.outputs.cache-hit != 'true'
+    uses: actions/checkout@v4
+    with: 
+      repository: Macro-Deck-App/Macro-Deck
+      ref: "v${{fromJSON(env.manifest).target-macro-deck-version}}"
+      path: macro-deck
+
+  - name: Find MD Commit Hash from API Version
+    if: steps.cache-macro-deck.outputs.cache-hit != 'true'
+    id: md_commit_hash
+    shell: bash
+    working-directory: ./macro-deck
+    run: |
+      git fetch --all --tags
+      git ls-remote --tags "https://github.com/Macro-Deck-org/Macro-Deck.git" | cut -f 1 | xargs git grep --max-count 1 --name-only -e "PluginApiVersion\s*=\s*${{ fromJSON(env.manifest).target-plugin-api-version }}" | cut -f 1 -d ':' | head -n 1 | echo "COMMIT_HASH=$(cat -)" >> $GITHUB_OUTPUT
+
+  - name: Validate MD Commit Hash
+    if: steps.cache-macro-deck.outputs.cache-hit != 'true' && steps.md_commit_hash.outputs.COMMIT_HASH == ''
+    shell: bash
+    run: |
+      echo "::error file=ExtensionManifest.json::Unable to find commit for provided Target Plugin API Version ${{ fromJSON(env.manifest).target-plugin-api-version }}" && exit 1
+
+  - name: "[Plugin] Setup .NET"
+    if: fromJSON(env.manifest).type == 'Plugin' || fromJSON(env.manifest).type == 0
+    uses: actions/setup-dotnet@v3
+    with:
+      dotnet-version: |
+        8.0.x
+
+  - name: "[Plugin] Remove Pre Build Targets"
+    if: steps.cache-macro-deck.outputs.cache-hit != 'true' && (fromJSON(env.manifest).type == 'Plugin' || fromJSON(env.manifest).type == 0)
+    working-directory: ./macro-deck/MacroDeck
+    shell: bash
+    run : |
+      xmlstarlet ed -P -L --delete '//Target[@Name="PreBuild"]' *.csproj
+      xmlstarlet ed -P -L --delete '//Target[@Name="PostBuild"]' *.csproj
+
+  - name: "[Plugin] Remove COM Reference"
+    if: steps.cache-macro-deck.outputs.cache-hit != 'true' && (fromJSON(env.manifest).type == 'Plugin' || fromJSON(env.manifest).type == 0)
+    working-directory: ./macro-deck/MacroDeck
+    shell: bash
+    run: dotnet remove reference NetFwTypeLib
+
+  - name: "[Plugin] Restore dependencies"
+    if: steps.cache-macro-deck.outputs.cache-hit != 'true' && (fromJSON(env.manifest).type == 'Plugin' || fromJSON(env.manifest).type == 0)
+    working-directory: ./macro-deck
+    shell: bash
+    run: dotnet restore -property:EnableWindowsTargeting=true
+
+  - name: "[Plugin] Build Macro Deck"
+    if: steps.cache-macro-deck.outputs.cache-hit != 'true' && (fromJSON(env.manifest).type == 'Plugin' || fromJSON(env.manifest).type == 0)
+    working-directory: ./macro-deck
+    shell: bash
+    run: >
+      dotnet build
+      --configuration release
+      --no-restore
+      --property:EnableWindowsTargeting=true
+      --property:SignAssembly=false
+      --output ./output
+
+  - name: "[Plugin] Remove Pre Build Targets"
+    if: fromJSON(env.manifest).type == 'Plugin' || fromJSON(env.manifest).type == 0
+    working-directory: ./${{ inputs.extension-path }}
+    shell: bash
+    run : |
+      xmlstarlet ed -P -L --delete '//Target[@Name="PreBuild"]' *.csproj 2>/dev/null || true
+      xmlstarlet ed -P -L --delete '//Target[@Name="PostBuild"]' *.csproj 2>/dev/null || true
+
+  - name: "[Plugin] Lowercase Subdir/Files in Resources"
+    if: |
+      (fromJSON(env.manifest).type == 'Plugin' || fromJSON(env.manifest).type == 0) &&
+      hashFiles('./${{ inputs.extension-path }}/Resources') != ''
+    working-directory: ./${{ inputs.extension-path }}
+    shell: bash
+    run: |
+      zip -0 -r resources.zip Resources/* || true
+      unzip -LL resources.zip || true
+
+  - name: "[Plugin] Move dll into location"
+    if: fromJSON(env.manifest).type == 'Plugin' || fromJSON(env.manifest).type == 0
+    working-directory: ./macro-deck
+    shell: bash
+    run: |
+      cp './output/Macro Deck 2.dll' '../${{ inputs.extension-path }}/Macro Deck 2.dll'
+
+  - name: "[Plugin] Restore dependencies"
+    if: fromJSON(env.manifest).type == 'Plugin' || fromJSON(env.manifest).type == 0
+    working-directory: ./${{ inputs.extension-path }}
+    shell: bash
+    run: dotnet restore "$(ls *.csproj | head -n1)" /p:EnableWindowsTargeting=true
+
+  - name: "[Plugin] Build Plugin"
+    if: fromJSON(env.manifest).type == 'Plugin' || fromJSON(env.manifest).type == 0
+    id: build_plugin
+    working-directory: ./${{ inputs.extension-path }}
+    shell: bash
+    run: >
+      dotnet build "$(ls *.csproj | head -n1)"
+      --configuration release
+      --no-restore
+      --property:EnableWindowsTargeting=true
+      --property:SignAssembly=false
+      --property:IncludeSourceRevisionInInformationalVersion=false
+      --property:CopyLocalLockFileAssemblies=true
+      --output ./output
+
+  - name: "[Plugin] Test"
+    if: fromJSON(env.manifest).type == 'Plugin' || fromJSON(env.manifest).type == 0
+    id: plugin_test
+    working-directory: ./${{ inputs.extension-path }}
+    shell: bash
+    run: dotnet test "$(ls *.csproj | head -n1)" --no-build --verbosity normal
+
+  - name: Prepare Distributable Staging Area
+    shell: bash
+    run: mkdir dist
+
+  - name: "[Plugin] Stage Distributable"
+    if: fromJSON(env.manifest).type == 'Plugin' || fromJSON(env.manifest).type == 0
+    shell: bash
+    run: |
+      cp ./${{ inputs.extension-path }}/output/*.* ./dist
+      cp ./${{ inputs.extension-path }}/ExtensionManifest.json ./dist
+      cp ./${{ inputs.extension-path }}/ExtensionIcon.png ./dist
+      cp ./${{ inputs.extension-path }}/README.md ./dist 2>/dev/null || true
+      cp ./${{ inputs.extension-path }}/LICENSE ./dist 2>/dev/null || true
+
+  - name: "[Icon Pack] Stage Distributable"
+    if: fromJSON(env.manifest).type == 'IconPack' || fromJSON(env.manifest).type == 1
+    shell: bash
+    run: |
+      cp ./${{ inputs.extension-path }}/*.{gif,jpg,png} ./dist 2>/dev/null || true
+      cp ./${{ inputs.extension-path }}/README.md ./dist 2>/dev/null || true
+      cp ./${{ inputs.extension-path }}/LICENSE ./dist 2>/dev/null || true
+      cp ./${{ inputs.extension-path }}/ExtensionManifest.json ./dist
+
+  - name: Package Distributable
+    shell: bash
+    run: |
+      cd ./dist
+      zip -r ../${{ inputs.artifact-name }}.zip . -i *
+
+  - name: Upload a Build Artifact
+    uses: actions/upload-artifact@v4.6.1
+    with:
+      path: ./${{ inputs.artifact-name }}.zip
+      name: ${{ inputs.artifact-name }}
+      if-no-files-found: error
+
+  - name: Set error code
+    id: set_error_code
+    if: failure()
+    shell: bash
+    run: |
+      if [ ${{ steps.validate_extension_manifest.outcome }} = "failure" ]; then
+        echo "-1000"
+      else if [ ${{ steps.build_plugin.outcome }} = "failure" ]; then
+        echo "-2000"
+      else if [ ${{ steps.plugin_test.outcome }} = "failure" ]; then
+          echo "-3000"
+      fi
