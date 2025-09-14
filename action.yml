@@ -1,6 +1,7 @@
 name: 'Build Macro Deck Extension'
 description: 'Build a Macro Deck Extension from source'
-
+on:
+  workflow_dispatch:   # 👈 this makes it runnable by hand
 inputs:
   extension-path:
     description: 'Path of the extension'
